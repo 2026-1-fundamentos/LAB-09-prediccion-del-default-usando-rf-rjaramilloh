@@ -44,8 +44,9 @@
 # - Elimine los registros con informacion no disponible.
 # - Para la columna EDUCATION, valores > 4 indican niveles superiores
 #   de educación, agrupe estos valores en la categoría "others".
-# - Renombre la columna "default payment next month" a "default"
-# - Remueva la columna "ID".
+#
+# Renombre la columna "default payment next month" a "default"
+# y remueva la columna "ID".
 #
 #
 # Paso 2.
@@ -57,7 +58,9 @@
 # contener las siguientes capas:
 # - Transforma las variables categoricas usando el método
 #   one-hot-encoding.
-# - Ajusta un modelo de bosques aleatorios (rando forest).
+# - Escala las demas variables al intervalo [0, 1].
+# - Selecciona las K mejores caracteristicas.
+# - Ajusta un modelo de regresion logistica.
 #
 #
 # Paso 4.
@@ -79,8 +82,8 @@
 # Este diccionario tiene un campo para indicar si es el conjunto
 # de entrenamiento o prueba. Por ejemplo:
 #
-# {'dataset': 'train', 'precision': 0.8, 'balanced_accuracy': 0.7, 'recall': 0.9, 'f1_score': 0.85}
-# {'dataset': 'test', 'precision': 0.7, 'balanced_accuracy': 0.6, 'recall': 0.8, 'f1_score': 0.75}
+# {'type': 'metrics', 'dataset': 'train', 'precision': 0.8, 'balanced_accuracy': 0.7, 'recall': 0.9, 'f1_score': 0.85}
+# {'type': 'metrics', 'dataset': 'test', 'precision': 0.7, 'balanced_accuracy': 0.6, 'recall': 0.8, 'f1_score': 0.75}
 #
 #
 # Paso 7.
@@ -93,153 +96,193 @@
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
 
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, MinMaxScaler
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.model_selection import GridSearchCV
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    balanced_accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+)
 import gzip
+import pickle
+import pandas as pd
 import json
 import os
-import pickle
-import zipfile
-from glob import glob
-from pathlib import Path
 
-import pandas as pd  # type: ignore
-from sklearn.compose import ColumnTransformer  # type: ignore
-from sklearn.ensemble import RandomForestClassifier  # type: ignore
-from sklearn.metrics import (  # type: ignore
-    balanced_accuracy_score,
-    confusion_matrix,
-    f1_score,
-    precision_score,
-    recall_score,
-)
-from sklearn.model_selection import GridSearchCV  # type: ignore
-from sklearn.pipeline import Pipeline  # type: ignore
-from sklearn.preprocessing import OneHotEncoder  # type: ignore
+# ===========================
+# Paso 1: Limpieza de datos
+# ===========================
 
-def leer_zip_a_dfs(directorio: str) -> list[pd.DataFrame]:
-    dataframes = []
-    for zip_path in glob(os.path.join(directorio, "*")):
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            for miembro in zf.namelist():
-                with zf.open(miembro) as fh:
-                    dataframes.append(pd.read_csv(fh, sep=",", index_col=0))
-    return dataframes
+def procesar_datos(df):
+    df = df.copy()
+    df.drop(columns='ID', inplace=True)
+    df.rename(columns={'default payment next month': 'default'}, inplace=True)
+    df.dropna(inplace=True)
+    df = df[(df['EDUCATION'] != 0) & (df['MARRIAGE'] != 0)]
+    df.loc[df['EDUCATION'] > 4, 'EDUCATION'] = 4
+    return df
 
-def reiniciar_directorio(ruta: str) -> None:
-    if os.path.exists(ruta):
-        for f in glob(os.path.join(ruta, "*")):
-            try:
-                os.remove(f)
-            except IsADirectoryError:
-                pass
-        try:
-            os.rmdir(ruta)
-        except OSError:
-            pass
-    os.makedirs(ruta, exist_ok=True)
+# ===================
+# Paso 3: Pipeline
+# ===================
 
+def construir_pipeline():
+    categorias = ['SEX', 'EDUCATION', 'MARRIAGE']
+    continuas = [
+        "LIMIT_BAL", "AGE", "PAY_0", "PAY_2", "PAY_3", "PAY_4", "PAY_5", "PAY_6",
+        "BILL_AMT1", "BILL_AMT2", "BILL_AMT3", "BILL_AMT4", "BILL_AMT5", "BILL_AMT6",
+        "PAY_AMT1", "PAY_AMT2", "PAY_AMT3", "PAY_AMT4", "PAY_AMT5", "PAY_AMT6"
+    ]
 
-def guardar_modelo_gz(ruta_salida: str, objeto) -> None:
-    reiniciar_directorio(os.path.dirname(ruta_salida))
-    with gzip.open(ruta_salida, "wb") as fh:
-        pickle.dump(objeto, fh)
-
-def depurar(df: pd.DataFrame) -> pd.DataFrame:
-    tmp = df.copy()
-    tmp = tmp.rename(columns={"default payment next month": "default"})
-
-    tmp = tmp.loc[tmp["MARRIAGE"] != 0]
-    tmp = tmp.loc[tmp["EDUCATION"] != 0]
-
-    tmp["EDUCATION"] = tmp["EDUCATION"].apply(lambda v: 4 if v >= 4 else v)
-
-    return tmp.dropna()
-
-def separar_xy(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
-    X = df.drop(columns=["default"])
-    y = df["default"]
-    return X, y
-
-def ensamblar_busqueda() -> GridSearchCV:
-    cat_cols = ["SEX", "EDUCATION", "MARRIAGE"]
-    ohe = OneHotEncoder(handle_unknown="ignore")
-    ct = ColumnTransformer(
-        transformers=[("cat", ohe, cat_cols)],
-        remainder="passthrough",
+    transformador = ColumnTransformer(
+        transformers=[
+            ('categorical', OneHotEncoder(handle_unknown='ignore'), categorias),
+            ('numerical', MinMaxScaler(), continuas)
+        ],
+        remainder='passthrough'
     )
 
-    clf = RandomForestClassifier(random_state=42)
-    pipe = Pipeline(
-        steps=[
-            ("prep", ct),
-            ("rf", clf),
-        ]
+    seleccionador = SelectKBest(score_func=f_classif)
+
+    pipe = Pipeline(steps=[
+        ('preprocessing', transformador),
+        ('feature_selection', seleccionador),
+        ('logistic', LogisticRegression(max_iter=1000, solver='saga', random_state=42))
+    ])
+    return pipe
+
+# ========================================
+# Paso 4: Optimización de hiperparámetros
+# =========================================
+
+def ajustar_modelo(pipeline, cv_folds, X_train, y_train, metric):
+    grid = GridSearchCV(
+        estimator=pipeline,
+        param_grid={
+            'feature_selection__k': range(1, 11),
+            'logistic__penalty': ['l1', 'l2'],
+            'logistic__C': [0.001, 0.01, 0.1, 1, 10, 100],
+        },
+        cv=cv_folds,
+        scoring=metric,
+        verbose=0
     )
+    grid.fit(X_train, y_train)
+    return grid
 
-    grid_params = {
-        "rf__n_estimators": [100, 200, 500],
-        "rf__max_depth": [None, 5, 10],
-        "rf__min_samples_split": [2, 5],
-        "rf__min_samples_leaf": [1, 2],
+
+# ============================
+# Paso 5: Cálculo de Métricas
+# ============================
+
+def obtener_metricas(modelo, X_train, y_train, X_test, y_test):
+    y_pred_train = modelo.predict(X_train)
+    y_pred_test = modelo.predict(X_test)
+
+    metrics_train = {
+        'type': 'metrics',
+        'dataset': 'train',
+        'precision': precision_score(y_train, y_pred_train),
+        'balanced_accuracy': balanced_accuracy_score(y_train, y_pred_train),
+        'recall': recall_score(y_train, y_pred_train),
+        'f1_score': f1_score(y_train, y_pred_train)
     }
 
-    gs = GridSearchCV(
-        estimator=pipe,
-        param_grid=grid_params,
-        cv=10,
-        scoring="balanced_accuracy",
-        n_jobs=-1,
-        refit=True,
-        verbose=2,
-    )
-    return gs
-
-def empaquetar_metricas(etiqueta: str, y_true, y_pred) -> dict:
-    return {
-        "type": "metrics",
-        "dataset": etiqueta,
-        "precision": precision_score(y_true, y_pred, zero_division=0),
-        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
-        "recall": recall_score(y_true, y_pred, zero_division=0),
-        "f1_score": f1_score(y_true, y_pred, zero_division=0),
+    metrics_test = {
+        'type': 'metrics',
+        'dataset': 'test',
+        'precision': precision_score(y_test, y_pred_test),
+        'balanced_accuracy': balanced_accuracy_score(y_test, y_pred_test),
+        'recall': recall_score(y_test, y_pred_test),
+        'f1_score': f1_score(y_test, y_pred_test)
     }
 
-def empaquetar_matriz_conf(etiqueta: str, y_true, y_pred) -> dict:
-    cm = confusion_matrix(y_true, y_pred)
-    return {
-        "type": "cm_matrix",
-        "dataset": etiqueta,
-        "true_0": {"predicted_0": int(cm[0][0]), "predicted_1": int(cm[0][1])},
-        "true_1": {"predicted_0": int(cm[1][0]), "predicted_1": int(cm[1][1])},
+    return metrics_train, metrics_test
+
+
+# ============================
+# Paso 6: Matriz de confusión
+# ============================
+
+def generar_confusiones(modelo, X_train, y_train, X_test, y_test):
+    y_pred_train = modelo.predict(X_train)
+    y_pred_test = modelo.predict(X_test)
+
+    cm_train = confusion_matrix(y_train, y_pred_train)
+    cm_test = confusion_matrix(y_test, y_pred_test)
+
+    tn_train, fp_train, fn_train, tp_train = cm_train.ravel()
+    tn_test, fp_test, fn_test, tp_test = cm_test.ravel()
+
+    cm_dict_train = {
+        'type': 'cm_matrix',
+        'dataset': 'train',
+        'true_0': {'predicted_0': int(tn_train), 'predicted_1': int(fp_train)},
+        'true_1': {'predicted_0': int(fn_train), 'predicted_1': int(tp_train)}
     }
 
-def main() -> None:
-    df_list = [depurar(d) for d in leer_zip_a_dfs("files/input")]
+    cm_dict_test = {
+        'type': 'cm_matrix',
+        'dataset': 'test',
+        'true_0': {'predicted_0': int(tn_test), 'predicted_1': int(fp_test)},
+        'true_1': {'predicted_0': int(fn_test), 'predicted_1': int(tp_test)}
+    }
 
-    test_df, train_df = df_list
+    return cm_dict_train, cm_dict_test
 
-    X_tr, y_tr = separar_xy(train_df)
-    X_te, y_te = separar_xy(test_df)
+# =======================
+# Paso 7: Guardar modelo
+# =======================
 
-    buscador = ensamblar_busqueda()
-    buscador.fit(X_tr, y_tr)
+def guardar_modelo(modelo, path):
+    with gzip.open(path, 'wb') as f:
+        pickle.dump(modelo, f)
 
-    guardar_modelo_gz(os.path.join("files", "models", "model.pkl.gz"), buscador)
 
-    yhat_test = buscador.predict(X_te)
-    yhat_train = buscador.predict(X_tr)
-
-    m_test = empaquetar_metricas("test", y_te, yhat_test)
-    m_train = empaquetar_metricas("train", y_tr, yhat_train)
-
-    cm_test = empaquetar_matriz_conf("test", y_te, yhat_test)
-    cm_train = empaquetar_matriz_conf("train", y_tr, yhat_train)
-
-    Path("files/output").mkdir(parents=True, exist_ok=True)
-    with open("files/output/metrics.json", "w", encoding="utf-8") as fh:
-        fh.write(json.dumps(m_train) + "\n")
-        fh.write(json.dumps(m_test) + "\n")
-        fh.write(json.dumps(cm_train) + "\n")
-        fh.write(json.dumps(cm_test) + "\n")
+# ====================
+# EJECUCIÓN DEL LAB
+# ====================
 
 if __name__ == "__main__":
-    main()
+
+    # Cargar datasets
+    df_train = pd.read_csv("files/input/train_data.csv.zip")
+    df_test = pd.read_csv("files/input/test_data.csv.zip")
+
+    # Limpiar datos
+    df_train = procesar_datos(df_train)
+    df_test = procesar_datos(df_test)
+
+    # Separar características y objetivo
+    X_train = df_train.drop(columns=['default'])
+    y_train = df_train['default']
+    X_test = df_test.drop(columns=['default'])
+    y_test = df_test['default']
+
+    # Construir pipeline
+    modelo_pipeline = construir_pipeline()
+
+    # Ajustar modelo
+    modelo_ajustado = ajustar_modelo(modelo_pipeline, 10, X_train, y_train, 'balanced_accuracy')
+
+    # Guardar modelo
+    os.makedirs("files/models", exist_ok=True)
+    guardar_modelo(modelo_ajustado, "files/models/model.pkl.gz")
+    # Calcular métricas y matrices
+    resultados = []
+
+    metricas_train, metricas_test = obtener_metricas(modelo_ajustado, X_train, y_train, X_test, y_test)
+    resultados.append(metricas_train)
+    resultados.append(metricas_test)
+
+    cm_train, cm_test = generar_confusiones(modelo_ajustado, X_train, y_train, X_test, y_test)
+    resultados.append(cm_train)
+    resultados.append(cm_test)
+
+    # Guardar resultados
+    os.makedirs("files/output", exist_ok=True)
+    with open("files/output/metrics.json", 'w') as f_out:
+        for item in resultados:
+            f_out.write(json.dumps(item) + '\n')
